@@ -1,0 +1,67 @@
+{
+  "name": "scholarfolio",
+  "version": "0.1.0",
+  "private": true,
+  "engines": {
+    "node": ">=20.9.0"
+  },
+  "scripts": {
+    "dev": "next dev -p 3000",
+    "build": "prisma generate && next build",
+    "start": "next start -p 3000",
+    "lint": "next lint",
+    "typecheck": "tsc --noEmit",
+    "contrast": "node scripts/check-contrast.mjs",
+    "smoke": "npm run build && tsx scripts/smoke.ts",
+    "probe:pool": "node scripts/pool-ceiling.mjs",
+    "probe:latency": "node scripts/db-latency.mjs",
+    "probe:pages": "node scripts/walk.mjs",
+    "db:generate": "prisma generate",
+    "db:migrate": "prisma migrate dev",
+    "db:deploy": "prisma migrate deploy",
+    "db:reset": "prisma migrate reset --force",
+    "db:seed": "prisma db seed",
+    "db:studio": "prisma studio",
+    "db:setup": "prisma migrate deploy && prisma db seed",
+    "postinstall": "prisma generate"
+  },
+  "prisma": {
+    "seed": "tsx prisma/seed.ts"
+  },
+  "dependencies": {
+    "@prisma/client": "6.3.1",
+    "@tailwindcss/postcss": "^4.3.3",
+    "clsx": "2.1.1",
+    "gsap": "3.12.7",
+    "lenis": "1.1.20",
+    "next": "15.5.26",
+    "postcss": "^8.5.28",
+    "react": "19.0.0",
+    "react-dom": "19.0.0",
+    "server-only": "0.0.1",
+    "tailwindcss": "^4.3.3",
+    "zod": "3.24.1"
+  },
+  "devDependencies": {
+    "@eslint/eslintrc": "3.3.7",
+    "@eslint/js": "9.21.0",
+    "@types/node": "20.17.19",
+    "@types/react": "19.0.8",
+    "@types/react-dom": "19.0.3",
+    "eslint": "9.21.0",
+    "eslint-config-next": "15.5.26",
+    "eslint-plugin-react-hooks": "5.2.0",
+    "prisma": "6.3.1",
+    "tsx": "4.19.2",
+    "typescript": "5.7.3",
+    "typescript-eslint": "8.71.0"
+  },
+  "allowScripts": {
+    "unrs-resolver@1.12.2": true,
+    "@prisma/client@6.3.1": true,
+    "@prisma/engines@6.3.1": true,
+    "prisma@6.3.1": true,
+    "esbuild@0.23.1": true,
+    "sharp@0.33.5": true
+  }
+}

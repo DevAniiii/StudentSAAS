@@ -1,0 +1,678 @@
+// ============================================================================
+//  ScholarFolio - Prisma schema
+//  Provider: PostgreSQL 15+
+//  Design notes:
+//   * Catalog (Course) is term-independent; Section is the term offering that
+//     students actually enroll in. Grades hang off Enrollment (per term), so
+//     cumulative GPA is derivable without denormalising a transcript table.
+//   * All monetary values are integer minor units — paise, at 100 to the rupee.
+//     Never floats. The *Cents column suffix is a historical name kept so the
+//     column names still match the ones already deployed; see src/lib/money.ts.
+//   * All instants are timestamptz. Day-only values (term bounds, class dates)
+//     are stored as Date and interpreted in the institution's local calendar.
+//   * Enums are native Postgres enums: typo-proof, indexable, no CHECK drift.
+// ============================================================================
+
+generator client {
+  provider        = "prisma-client-js"
+  previewFeatures = ["relationJoins"]
+}
+
+datasource db {
+  provider = "postgresql"
+  url      = env("DATABASE_URL")
+}
+
+// ---------------------------------------------------------------------------
+// Enums
+// ---------------------------------------------------------------------------
+
+enum Role {
+  STUDENT
+  FACULTY
+  ADMIN
+}
+
+enum TermStatus {
+  PLANNED
+  IN_PROGRESS
+  COMPLETED
+}
+
+enum SectionStatus {
+  OPEN
+  CLOSED
+  CANCELLED
+}
+
+enum EnrollmentStatus {
+  ENROLLED
+  WAITLISTED
+  DROPPED
+  COMPLETED
+}
+
+enum MeetingKind {
+  LECTURE
+  SEMINAR
+  LAB
+  STUDIO
+  TUTORIAL
+}
+
+enum MeetingExceptionKind {
+  CANCELLED
+  RELOCATED
+  RESCHEDULED
+}
+
+enum AssessmentKind {
+  ASSIGNMENT
+  LAB_REPORT
+  PROJECT
+  QUIZ
+  EXAM
+  PRESENTATION
+  PARTICIPATION
+}
+
+enum SubmissionStatus {
+  NOT_STARTED
+  DRAFT
+  SUBMITTED
+  LATE
+  GRADED
+  RETURNED
+}
+
+enum AttendanceStatus {
+  PRESENT
+  LATE
+  ABSENT
+  EXCUSED
+}
+
+enum InvoiceStatus {
+  DRAFT
+  ISSUED
+  PARTIALLY_PAID
+  PAID
+  OVERDUE
+  VOID
+}
+
+enum ChargeCategory {
+  TUITION
+  LAB_FEE
+  MATERIALS
+  HOUSING
+  TRANSCRIPT
+  LIBRARY_FINE
+  OTHER
+}
+
+enum PaymentMethod {
+  CARD
+  UPI
+  BANK_TRANSFER
+  CASH
+  SCHOLARSHIP
+  FINANCIAL_AID
+}
+
+enum AnnouncementAudience {
+  ALL_STUDENTS
+  COURSE
+  STUDY_YEAR
+  PROGRAM
+}
+
+enum NotificationKind {
+  ASSIGNMENT_DUE
+  GRADE_POSTED
+  ANNOUNCEMENT
+  MESSAGE_RECEIVED
+  PAYMENT_DUE
+  ATTENDANCE_RISK
+  SYSTEM
+}
+
+enum ThemePreference {
+  LIGHT
+  DARK
+  SYSTEM
+}
+
+enum DensityPreference {
+  COMFORTABLE
+  COMPACT
+}
+
+// ---------------------------------------------------------------------------
+// Identity & access
+// ---------------------------------------------------------------------------
+
+model User {
+  id           String   @id @default(cuid())
+  email        String   @unique
+  passwordHash String
+  role         Role     @default(STUDENT)
+  firstName    String
+  lastName     String
+  studentNumber String? @unique
+  /// Only meaningful for FACULTY / ADMIN.
+  title        String?
+  avatarHue    Int      @default(150)
+
+  studyYear Int?
+  programId String?
+  program   Program? @relation(fields: [programId], references: [id], onDelete: SetNull)
+
+  isActive    Boolean   @default(true)
+  lastLoginAt DateTime? @db.Timestamptz(3)
+  createdAt   DateTime  @default(now()) @db.Timestamptz(3)
+  updatedAt   DateTime  @updatedAt @db.Timestamptz(3)
+
+  sessions           Session[]
+  enrollments        Enrollment[]
+  taughtSections     Section[]          @relation("SectionInstructor")
+  submissions        Submission[]
+  attendanceRecords  AttendanceRecord[]
+  invoices           Invoice[]
+  payments           Payment[]
+  threadParticipations ThreadParticipant[]
+  messagesSent       Message[]
+  announcements      Announcement[]
+  notifications      Notification[]
+  auditEvents        AuditEvent[]
+
+  preferences UserPreference?
+  transcript  Transcript?
+
+  @@index([programId])
+  @@index([role, isActive])
+  @@map("users")
+}
+
+/// Per-user settings. One row per user, created lazily on first settings view.
+model UserPreference {
+  userId String @id
+  user   User   @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  theme          ThemePreference   @default(SYSTEM)
+  density        DensityPreference @default(COMFORTABLE)
+  weekStartsOn   Int               @default(1) // 0 = Sunday, 1 = Monday
+  timezone       String            @default("UTC")
+
+  notifyAssignmentDue Boolean @default(true)
+  notifyGradePosted   Boolean @default(true)
+  notifyAnnouncement  Boolean @default(true)
+  notifyMessages      Boolean @default(true)
+  notifyPaymentDue    Boolean @default(true)
+
+  updatedAt DateTime @updatedAt @db.Timestamptz(3)
+
+  @@map("user_preferences")
+}
+
+/// Opaque server-side sessions. The raw token is never stored — only its
+/// SHA-256 digest — so a database leak cannot be replayed as a login.
+model Session {
+  id        String   @id @default(cuid())
+  userId    String
+  user      User     @relation(fields: [userId], references: [id], onDelete: Cascade)
+  tokenHash String   @unique
+  expiresAt DateTime @db.Timestamptz(3)
+  createdAt DateTime @default(now()) @db.Timestamptz(3)
+  lastSeenAt DateTime @default(now()) @db.Timestamptz(3)
+
+  userAgent String?
+  ipAddress String?
+
+  @@index([userId])
+  // Session cleanup sweeps on a schedule; expiry alone, so the sweep never
+  // degrades into a sequential scan as the table grows.
+  @@index([expiresAt], map: "sessions_expiry_idx")
+  @@map("sessions")
+}
+
+// ---------------------------------------------------------------------------
+// Academic structure
+// ---------------------------------------------------------------------------
+
+model Program {
+  id        String @id @default(cuid())
+  code      String @unique // e.g. "BSC-CS"
+  name      String
+  faculty   String
+  years     Int    @default(4)
+
+  students User[]
+  courses  Course[]
+
+  @@map("programs")
+}
+
+model Term {
+  id       String     @id @default(cuid())
+  code     String     @unique // e.g. "2026-SPRING"
+  name     String
+  startsOn DateTime   @db.Date
+  endsOn   DateTime   @db.Date
+  status   TermStatus @default(PLANNED)
+  /// Weeks in the term, used by the Term Spine to draw the ledger ruler.
+  weekCount Int       @default(14)
+
+  sections     Section[]
+  enrollments  Enrollment[]
+  announcements Announcement[]
+  invoices     Invoice[]
+
+  @@index([status])
+  @@map("terms")
+}
+
+model Course {
+  id          String  @id @default(cuid())
+  code        String  @unique // e.g. "CS-241"
+  title       String
+  description String
+  credits     Int
+  level       Int     @default(100)
+  department  String
+
+  programId String?
+  program   Program? @relation(fields: [programId], references: [id], onDelete: SetNull)
+
+  sections Section[]
+  threads  Thread[]
+
+  @@index([department])
+  @@index([programId])
+  @@map("courses")
+}
+
+model Section {
+  id       String        @id @default(cuid())
+  courseId String
+  course   Course        @relation(fields: [courseId], references: [id], onDelete: Cascade)
+  termId   String
+  term     Term          @relation(fields: [termId], references: [id], onDelete: Cascade)
+  sectionNo String       @default("01")
+  status   SectionStatus @default(OPEN)
+  capacity Int
+  room     String?
+
+  instructorId String?
+  instructor   User?   @relation("SectionInstructor", fields: [instructorId], references: [id], onDelete: SetNull)
+
+  meetings        Meeting[]
+  exceptions      MeetingException[]
+  enrollments     Enrollment[]
+  assessments     Assessment[]
+  attendanceSessions AttendanceSession[]
+  announcements   Announcement[]
+
+  @@unique([courseId, termId, sectionNo])
+  @@index([termId, status])
+  @@index([instructorId])
+  @@map("sections")
+}
+
+/// A recurring weekly slot. Stored as minutes-from-midnight rather than
+/// `time` so ordering and overlap checks are trivial integer comparisons and
+/// the value is timezone-agnostic (a 09:00 lecture is 09:00 for everyone).
+model Meeting {
+  id        String      @id @default(cuid())
+  sectionId String
+  section   Section     @relation(fields: [sectionId], references: [id], onDelete: Cascade)
+  dayOfWeek Int // 0 = Monday .. 6 = Sunday
+  startMin  Int // minutes from midnight, inclusive
+  endMin    Int // exclusive
+  kind      MeetingKind @default(LECTURE)
+  room      String?
+
+  exceptions MeetingException[]
+
+  @@unique([sectionId, dayOfWeek, startMin])
+  @@index([sectionId, dayOfWeek])
+  @@map("meetings")
+}
+
+model MeetingException {
+  id        String              @id @default(cuid())
+  meetingId String
+  meeting   Meeting             @relation(fields: [meetingId], references: [id], onDelete: Cascade)
+  /// Denormalised from Meeting.sectionId so "all disruptions this week" is a
+  /// single index scan instead of a three-table join on the hot path.
+  sectionId String
+  section   Section             @relation(fields: [sectionId], references: [id], onDelete: Cascade)
+  date      DateTime            @db.Date
+  kind      MeetingExceptionKind
+  note      String?
+  /// Populated for RELOCATED / RESCHEDULED.
+  room      String?
+  startMin  Int?
+  endMin    Int?
+
+  @@unique([meetingId, date])
+  @@index([sectionId, date])
+  @@index([date])
+  @@map("meeting_exceptions")
+}
+
+model Enrollment {
+  id        String           @id @default(cuid())
+  studentId String
+  student   User             @relation(fields: [studentId], references: [id], onDelete: Cascade)
+  sectionId String
+  section   Section          @relation(fields: [sectionId], references: [id], onDelete: Cascade)
+  termId    String
+  term      Term             @relation(fields: [termId], references: [id], onDelete: Cascade)
+  status    EnrollmentStatus @default(ENROLLED)
+
+  /// Final outcome, written when the term closes.
+  letterGrade    String?
+  gradePoints    Decimal? @db.Decimal(3, 2)
+  finalPercent   Decimal? @db.Decimal(5, 2)
+  creditsEarned  Decimal? @db.Decimal(4, 1)
+  gradedAt       DateTime? @db.Timestamptz(3)
+
+  enrolledAt DateTime @default(now()) @db.Timestamptz(3)
+  updatedAt  DateTime @updatedAt @db.Timestamptz(3)
+
+  @@unique([studentId, sectionId])
+  @@index([studentId, status])
+  @@index([termId])
+  @@map("enrollments")
+}
+
+model Assessment {
+  id            String         @id @default(cuid())
+  sectionId     String
+  section       Section        @relation(fields: [sectionId], references: [id], onDelete: Cascade)
+  title         String
+  brief         String?
+  kind          AssessmentKind
+  weightPercent Decimal        @db.Decimal(5, 2)
+  maxScore      Decimal        @default(100) @db.Decimal(8, 2)
+  dueAt         DateTime?      @db.Timestamptz(3)
+  releasedAt    DateTime?      @db.Timestamptz(3)
+  position      Int            @default(0)
+
+  submissions Submission[]
+
+  @@index([sectionId, dueAt])
+  @@index([releasedAt])
+  // `assessments_due_idx` (partial: only rows with a deadline, ascending) is
+  // created by the SQL migration. Prisma's DSL cannot express a WHERE clause on
+  // an index, so it is declared externally and reconciled by name.
+  @@map("assessments")
+}
+
+model Submission {
+  id            String           @id @default(cuid())
+  assessmentId  String
+  assessment    Assessment       @relation(fields: [assessmentId], references: [id], onDelete: Cascade)
+  studentId     String
+  student       User             @relation(fields: [studentId], references: [id], onDelete: Cascade)
+  status        SubmissionStatus @default(NOT_STARTED)
+  draftBody     String?
+  submittedAt   DateTime?        @db.Timestamptz(3)
+  /// Marks the attempt the grader should read; later attempts are kept for audit.
+  attempt       Int              @default(1)
+  score         Decimal?         @db.Decimal(8, 2)
+  feedback      String?
+  gradedAt      DateTime?        @db.Timestamptz(3)
+  createdAt     DateTime         @default(now()) @db.Timestamptz(3)
+  updatedAt     DateTime         @updatedAt @db.Timestamptz(3)
+
+  @@unique([assessmentId, studentId])
+  @@index([studentId, status])
+  @@index([studentId, submittedAt])
+  @@map("submissions")
+}
+
+model AttendanceSession {
+  id        String   @id @default(cuid())
+  sectionId String
+  section   Section  @relation(fields: [sectionId], references: [id], onDelete: Cascade)
+  date      DateTime @db.Date
+  topic     String?
+  openedAt  DateTime @default(now()) @db.Timestamptz(3)
+  closedAt  DateTime? @db.Timestamptz(3)
+
+  records AttendanceRecord[]
+
+  @@unique([sectionId, date])
+  @@index([date])
+  @@map("attendance_sessions")
+}
+
+model AttendanceRecord {
+  id        String           @id @default(cuid())
+  sessionId String
+  session   AttendanceSession @relation(fields: [sessionId], references: [id], onDelete: Cascade)
+  studentId String
+  student   User             @relation(fields: [studentId], references: [id], onDelete: Cascade)
+  status    AttendanceStatus
+  note      String?
+  markedAt  DateTime         @default(now()) @db.Timestamptz(3)
+
+  @@unique([sessionId, studentId])
+  // Heat strip: one student's whole term, reverse chronological. Keyed on
+  // `markedAt` — when the register was closed — because `attendance_records`
+  // deliberately has no `createdAt`.
+  @@index([studentId, markedAt], map: "attendance_records_student_recent_idx")
+  @@map("attendance_records")
+}
+
+// ---------------------------------------------------------------------------
+// Finance
+// ---------------------------------------------------------------------------
+
+model Invoice {
+  id       String        @id @default(cuid())
+  number   String        @unique // human-facing, e.g. "INV-2026-0142"
+  studentId String
+  student  User          @relation(fields: [studentId], references: [id], onDelete: Cascade)
+  termId   String?
+  term     Term?         @relation(fields: [termId], references: [id], onDelete: SetNull)
+  status   InvoiceStatus @default(DRAFT)
+
+  issuedOn DateTime  @db.Date
+  dueOn    DateTime  @db.Date
+  currency String   @default("INR")
+
+  subtotalCents Int
+  taxCents      Int @default(0)
+  totalCents    Int
+
+  notes String?
+  createdAt DateTime @default(now()) @db.Timestamptz(3)
+  updatedAt DateTime @updatedAt @db.Timestamptz(3)
+
+  lines   InvoiceLine[]
+  payments Payment[]
+
+  @@index([studentId, status])
+  @@index([dueOn])
+  @@index([studentId, issuedOn])
+  // `invoices_open_by_due_idx` (partial: unsettled invoices only) comes from the
+  // SQL migration, since the DSL has no WHERE clause.
+  @@map("invoices")
+}
+
+model InvoiceLine {
+  id          String         @id @default(cuid())
+  invoiceId   String
+  invoice     Invoice        @relation(fields: [invoiceId], references: [id], onDelete: Cascade)
+  description String
+  category    ChargeCategory
+  quantity    Int            @default(1)
+  unitPriceCents Int
+  amountCents Int
+  position    Int            @default(0)
+
+  @@index([invoiceId])
+  @@map("invoice_lines")
+}
+
+model Payment {
+  id          String        @id @default(cuid())
+  receiptNo   String        @unique // human-facing, e.g. "RCPT-88301"
+  invoiceId   String?
+  invoice     Invoice?      @relation(fields: [invoiceId], references: [id], onDelete: SetNull)
+  studentId   String
+  student     User          @relation(fields: [studentId], references: [id], onDelete: Cascade)
+  amountCents Int
+  currency    String        @default("INR")
+  method      PaymentMethod
+  reference   String?
+  paidAt      DateTime      @db.Timestamptz(3)
+  createdAt   DateTime      @default(now()) @db.Timestamptz(3)
+
+  /// Client-supplied dedupe key. Unique so a retried request cannot
+  /// double-charge. NULL values are exempt from uniqueness in Postgres.
+  idempotencyKey String? @unique
+
+  @@index([studentId, paidAt])
+  @@index([invoiceId])
+  // `payments_idempotency_lookup_idx` (partial: only rows carrying a key) comes
+  // from the SQL migration. The unique constraint above is the actual
+  // correctness boundary; this only speeds up the lookup.
+  @@map("payments")
+}
+
+// ---------------------------------------------------------------------------
+// Communication
+// ---------------------------------------------------------------------------
+
+model Announcement {
+  id       String   @id @default(cuid())
+  title    String
+  body     String
+  authorId String
+  author   User     @relation(fields: [authorId], references: [id], onDelete: Cascade)
+  audience AnnouncementAudience @default(ALL_STUDENTS)
+  sectionId String?
+  section   Section? @relation(fields: [sectionId], references: [id], onDelete: Cascade)
+  termId    String?
+  term      Term?    @relation(fields: [termId], references: [id], onDelete: SetNull)
+  /// Target year for `STUDY_YEAR` notices. Null for every other audience.
+  studyYear Int?
+  pinned   Boolean  @default(false)
+  publishedAt DateTime @default(now()) @db.Timestamptz(3)
+  expiresAt DateTime? @db.Timestamptz(3)
+
+  @@index([publishedAt])
+  @@index([pinned, publishedAt])
+  @@index([sectionId])
+  @@index([audience, studyYear])
+  @@map("announcements")
+}
+
+model Thread {
+  id       String @id @default(cuid())
+  subject  String
+  /// Optional course link, so the inbox can group and label a conversation.
+  courseId String?
+  course   Course?  @relation(fields: [courseId], references: [id], onDelete: SetNull)
+  updatedAt DateTime @updatedAt @db.Timestamptz(3)
+  createdAt DateTime @default(now()) @db.Timestamptz(3)
+
+  participants ThreadParticipant[]
+  messages     Message[]
+
+  // Inbox list: threads the student participates in, most recently active.
+  @@index([updatedAt])
+  // `threads_recent_idx` (DESC) is declared externally in the SQL migration.
+  @@map("threads")
+}
+
+model ThreadParticipant {
+  threadId String
+  thread   Thread @relation(fields: [threadId], references: [id], onDelete: Cascade)
+  userId   String
+  user     User   @relation(fields: [userId], references: [id], onDelete: Cascade)
+  /// Last time this participant opened the thread; drives unread badges.
+  lastReadAt DateTime? @db.Timestamptz(3)
+
+  @@id([threadId, userId])
+  @@index([userId])
+  @@map("thread_participants")
+}
+
+model Message {
+  id        String   @id @default(cuid())
+  threadId  String
+  thread    Thread   @relation(fields: [threadId], references: [id], onDelete: Cascade)
+  senderId  String
+  sender    User     @relation(fields: [senderId], references: [id], onDelete: Cascade)
+  body      String
+  createdAt DateTime @default(now()) @db.Timestamptz(3)
+  editedAt  DateTime? @db.Timestamptz(3)
+
+  @@index([threadId, createdAt])
+  @@index([senderId])
+  @@map("messages")
+}
+
+model Notification {
+  id        String           @id @default(cuid())
+  userId    String
+  user      User             @relation(fields: [userId], references: [id], onDelete: Cascade)
+  kind      NotificationKind
+  title     String
+  body      String
+  href      String?
+  readAt    DateTime?        @db.Timestamptz(3)
+  createdAt DateTime         @default(now()) @db.Timestamptz(3)
+
+  @@index([userId, readAt, createdAt])
+  // `notifications_unread_idx` (partial: unread rows only, descending) comes
+  // from the SQL migration. "How many unread?" runs on every authenticated
+  // render, so this stays O(unread) rather than O(total).
+  @@map("notifications")
+}
+
+// ---------------------------------------------------------------------------
+// Records
+// ---------------------------------------------------------------------------
+
+/// One row per term per student. Written when a term closes; it is the
+/// authoritative historical record even if an Enrollment is later corrected.
+model Transcript {
+  id          String   @id @default(cuid())
+  studentId   String   @unique
+  student     User     @relation(fields: [studentId], references: [id], onDelete: Cascade)
+  cumulativeGpa  Decimal @db.Decimal(4, 3)
+  creditsAttempted Decimal @db.Decimal(6, 1)
+  creditsEarned    Decimal @db.Decimal(6, 1)
+  standing    String
+  generatedAt DateTime @default(now()) @db.Timestamptz(3)
+
+  @@map("transcripts")
+}
+
+/// Append-only security/audit trail. Never updated, never cascaded away.
+model AuditEvent {
+  id         String   @id @default(cuid())
+  actorId    String?
+  actor      User?    @relation(fields: [actorId], references: [id], onDelete: SetNull)
+  action     String // e.g. "auth.login.failed", "payment.created"
+  resource   String?
+  resourceId String?
+  outcome    String   @default("SUCCESS")
+  ipAddress  String?
+  userAgent  String?
+  metadata   Json?
+  createdAt  DateTime @default(now()) @db.Timestamptz(3)
+
+  @@index([actorId, createdAt])
+  @@index([action, createdAt])
+  // `audit_events_actor_recent_idx` (same columns, DESC) is declared externally
+  // in the SQL migration. Postgres scans an ascending index backwards at the same
+  // cost, so this covers the admin trail lookup too.
+  @@map("audit_events")
+}

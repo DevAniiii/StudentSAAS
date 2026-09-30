@@ -1,0 +1,13 @@
+-- UPI as a payment method.
+--
+-- The most common way an Indian student pays a college bill, and its absence was
+-- a visible one: the seeded receipt for the laboratory and library invoice was
+-- recorded as a card payment, which sends the wrong signal about how fees are
+-- actually settled here.
+--
+-- `ADD VALUE` is additive and does not rewrite the enum, so this is safe to run
+-- against a live table. PostgreSQL has allowed it inside a transaction block
+-- since version 12; the only remaining restriction is that a value added in the
+-- same transaction cannot then be used, which does not apply here because the
+-- rows that use it are written by the seed afterwards.
+ALTER TYPE "PaymentMethod" ADD VALUE 'UPI';
